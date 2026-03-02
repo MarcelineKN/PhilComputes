@@ -1,0 +1,922 @@
+library(tidycensus)
+library(dplyr)
+library(tidyr)
+library(segregation)
+library(stringr)
+library(ggplot2)
+
+race_vars <- c(
+  white = "B02001_002",
+  black = "B02001_003",
+  native_am = "B02001_004",
+  asian = "B02001_005",
+  pacific = "B02001_006",
+  other = "B02001_007"
+)
+
+hi_raw <- get_acs(
+  geography = "tract",
+  state = "HI",
+  variables = race_vars,
+  year = 2019,
+  survey = "acs5"
+)
+
+unique(head(hi_raw$variable, 20))
+
+####multirace excluded####
+hi_tract_race_long <- get_acs(
+  geography = "tract",
+  state = "HI",
+  variables = race_vars,
+  year = 2019,
+  survey = "acs5"
+) %>%
+  mutate(
+    race = if_else(
+      variable %in% names(race_vars),
+      variable,
+      names(race_vars)[match(variable, race_vars)]
+    )
+  ) %>%
+  transmute(
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5),
+    race,
+    n = estimate
+  ) %>%
+  filter(!is.na(race), !is.na(n), n > 0)
+
+mh_by_county <- mutual_within(
+  hi_tract_race_long,
+  group = "race",
+  unit  = "tract",
+  within = "county",
+  weight = "n",
+  wide = TRUE
+) %>%
+  as_tibble()
+
+mh_statewide <- mutual_total(
+  hi_tract_race_long,
+  group = "race",
+  unit  = "tract",
+  weight = "n"
+)
+
+mh_by_county_boot <- mutual_within(
+  hi_tract_race_long,
+  group = "race",
+  unit  = "tract",
+  within = "county",
+  weight = "n",
+  wide = TRUE,
+  se = TRUE,
+  CI = 0.95,
+  n_bootstrap = 500
+)
+
+dissimilarity_by_county <- function(data_long, group_a, group_b, county_col = "county",
+                                    unit_col = "tract", group_col = "race", n_col = "n") {
+  wide <- data_long %>%
+    filter(.data[[group_col]] %in% c(group_a, group_b)) %>%
+    select(all_of(c(county_col, unit_col, group_col, n_col))) %>%
+    pivot_wider(names_from = all_of(group_col), values_from = all_of(n_col), values_fill = 0)
+  
+  # Ensure both group columns exist!!
+  if (!group_a %in% names(wide)) wide[[group_a]] <- 0
+  if (!group_b %in% names(wide)) wide[[group_b]] <- 0
+  
+  wide %>%
+    group_by(.data[[county_col]]) %>%
+    summarise(
+      D = {
+        Xa <- sum(.data[[group_a]], na.rm = TRUE)
+        Xb <- sum(.data[[group_b]], na.rm = TRUE)
+        if (Xa == 0 || Xb == 0) NA_real_ else {
+          0.5 * sum(abs((.data[[group_a]] / Xa) - (.data[[group_b]] / Xb)), na.rm = TRUE)
+        }
+      },
+      .groups = "drop"
+    ) %>%
+    rename(county = all_of(county_col))
+}
+
+hi_long_nhpi <- hi_tract_race_long %>%
+  mutate(
+    race2 = case_when(
+      race == "white" ~ "white",
+      race %in% c("native_am", "pacific") ~ "nhpi",
+      TRUE ~ "other"
+    )
+  ) %>%
+  group_by(tract, county, race2) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  rename(race = race2)
+
+D_white_nhpi <- dissimilarity_by_county(hi_long_nhpi, "white", "nhpi")
+
+####multirace vs allelse####
+vars_multi <- c(
+  total = "B02001_001",
+  multiracial = "B02001_008"
+)
+
+hi_tract_multi <- get_acs(
+  geography = "tract",
+  state = "HI",
+  variables = vars_multi,
+  year = 2019,
+  survey = "acs5"
+) %>%
+  mutate(varname = if_else(variable %in% names(vars_multi),
+                           variable,
+                           names(vars_multi)[match(variable, vars_multi)])) %>%
+  select(GEOID, varname, estimate) %>%
+  pivot_wider(names_from = varname, values_from = estimate) %>%
+  transmute(
+    tract = GEOID,
+    county = substr(GEOID, 1, 5),
+    multiracial = multiracial,
+    non_multiracial = pmax(total - multiracial, 0)
+  )
+
+hi_tract_multi_long <- hi_tract_multi %>%
+  pivot_longer(
+    cols = c(multiracial, non_multiracial),
+    names_to = "group",
+    values_to = "n"
+  ) %>%
+  filter(!is.na(n), n > 0)
+
+mh_multi_by_county <- mutual_within(
+  hi_tract_multi_long,
+  group  = "group",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble() %>%
+  rename(M = M, H = H)
+
+mh_multi_statewide <- mutual_total(
+  hi_tract_multi_long,
+  group  = "group",
+  unit   = "tract",
+  weight = "n"
+)
+
+D_multi_by_county <- hi_tract_multi %>%
+  group_by(county) %>%
+  summarise(
+    D = {
+      Xa <- sum(multiracial, na.rm = TRUE)
+      Xb <- sum(non_multiracial, na.rm = TRUE)
+      if (Xa == 0 || Xb == 0) NA_real_ else {
+        0.5 * sum(abs((multiracial / Xa) - (non_multiracial / Xb)), na.rm = TRUE)
+      }
+    },
+    .groups = "drop"
+  )
+
+multi_segregation_by_county <- mh_multi_by_county %>%
+  left_join(D_multi_by_county, by = "county")
+
+####multirace as own "race"####
+
+vacs <- load_variables(2022, "acs5", cache = TRUE)
+
+race_vars_full <- c(
+  white = "B02001_002",
+  black = "B02001_003",
+  native_am = "B02001_004",
+  asian = "B02001_005",
+  pacific = "B02001_006",
+  other = "B02001_007",
+  multiracial = "B02001_008"
+)
+
+hi_tract_race_long <- get_acs(
+  geography = "tract",
+  state = "HI",
+  variables = race_vars_full,
+  year = 2019,
+  survey = "acs5"
+) %>%
+  mutate(
+    race = if_else(
+      variable %in% names(race_vars_full),
+      variable,
+      names(race_vars_full)[match(variable, race_vars_full)]
+    )
+  ) %>%
+  transmute(
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5),
+    race,
+    n = estimate
+  ) %>%
+  filter(!is.na(race), !is.na(n), n > 0)
+
+mh_by_county_multigroup <- mutual_within(
+  hi_tract_race_long,
+  group  = "race",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble() %>%
+  rename(
+    M = M,
+    H = H
+  )
+
+###multirace v allelse, copied from above###
+hi_long_multi_vs_rest <- hi_tract_race_long %>%
+  mutate(
+    race2 = if_else(race == "multiracial", "multiracial", "non_multiracial")
+  ) %>%
+  group_by(tract, county, race2) %>%
+  summarise(n = sum(n), .groups = "drop")
+
+D_multi_vs_rest <- hi_long_multi_vs_rest %>%
+  group_by(county) %>%
+  summarise(
+    D = {
+      Xa <- sum(n[race2 == "multiracial"], na.rm = TRUE)
+      Xb <- sum(n[race2 == "non_multiracial"], na.rm = TRUE)
+      if (Xa == 0 || Xb == 0) NA_real_ else {
+        0.5 * sum(abs(
+          (n[race2 == "multiracial"] / Xa) -
+            (n[race2 == "non_multiracial"] / Xb)
+        ), na.rm = TRUE)
+      }
+    },
+    .groups = "drop"
+  )
+
+segregation_multigroup_results <- mh_by_county_multigroup %>%
+  left_join(D_multi_vs_rest, by = "county")
+
+####multirace as own "race", with disaggregated racial combinations####
+
+# 2020 Decennial DHC, table P8 (detailed race)
+race_raw <- get_decennial(
+  geography = "tract",
+  state = "HI",
+  year = 2020,
+  sumfile = "dhc",
+  table = "P8",
+  geometry = FALSE,
+  output = "wide"
+)
+
+vars <- load_variables(year = 2020, dataset = "dhc", cache = TRUE)
+
+p8_vars <- vars %>%
+  filter(str_detect(name, "^P8_")) %>%
+  select(variable = name, label)
+
+# clean labels so they’re short + consistent
+clean_p8_label <- function(x) {
+  x %>%
+    str_replace_all("^.*?!!", "") %>%          # drop the table prefix before the first '!!'
+    str_replace_all("!!", " / ") %>%          # make hierarchy readable
+    str_squish()
+}
+
+p8_map <- p8_vars %>%
+  mutate(combo = clean_p8_label(label))
+
+hi_tract_combo_long <- race_raw %>%
+  pivot_longer(
+    cols = starts_with("P8_"),
+    names_to = "variable",
+    values_to = "n"
+  ) %>%
+  left_join(p8_map, by = "variable") %>%
+  transmute(
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5),
+    combo,
+    n
+  ) %>%
+  filter(!is.na(combo), !is.na(n), n > 0)
+
+hi_tract_combo_long <- hi_tract_combo_long %>%
+  filter(!combo %in% c("Total:", "Total"))
+
+hi_tract_combo_long <- hi_tract_combo_long %>%
+  # drop grand total (no "/" levels)
+  filter(str_count(combo, "/") > 0) %>%
+  # drop subtotal rows like "Total: / Population of one race:"
+  filter(!str_detect(combo, regex(":\\s*$", ignore_case = TRUE)))
+
+mh_combo_by_county <- mutual_within(
+  hi_tract_combo_long,
+  group  = "combo",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble() %>%
+  rename(M = M, H = H)
+
+mh_combo_statewide <- mutual_total(
+  hi_tract_combo_long,
+  group  = "combo",
+  unit   = "tract",
+  weight = "n"
+)
+
+mh_combo_by_county
+mh_combo_statewide
+
+#sanity checks
+hi_tract_combo_long %>%
+  distinct(combo) %>%
+  slice(1:10)
+
+hi_tract_combo_long %>%
+  summarise(
+    n_groups = n_distinct(combo),
+    n_rows   = n()
+  )
+
+hi_tract_combo_long %>%
+  group_by(combo) %>%
+  summarise(total_n = sum(n), .groups = "drop") %>%
+  arrange(total_n) %>%
+  head(20)
+
+####fractional multirace - rep prop of counties####
+
+# Pull tract-level totals + multiracial bucket (B02001)
+vars_base <- c(
+  total       = "B02001_001",
+  multiracial = "B02001_008"
+)
+
+hi_base <- get_acs(
+  geography = "tract",
+  state = "HI",
+  variables = vars_base,
+  year = 2019,
+  survey = "acs5",
+  output = "wide"
+) %>%
+  transmute(
+    GEOID,
+    total       = totalE,
+    multiracial = multiracialE,
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5)
+  )
+
+vars_combo <- c(
+  white_any     = "B02008_001",
+  black_any     = "B02009_001",
+  native_am_any = "B02010_001",
+  asian_any     = "B02011_001",
+  pacific_any   = "B02012_001",
+  other_any     = "B02013_001"
+)
+
+hi_any <- get_acs(
+  geography = "tract",
+  state = "HI",
+  variables = vars_combo,
+  year = 2019,
+  survey = "acs5",
+  output = "wide"
+) %>%
+  transmute(
+    GEOID,
+    white_any     = white_anyE,
+    black_any     = black_anyE,
+    native_am_any = native_am_anyE,
+    asian_any     = asian_anyE,
+    pacific_any   = pacific_anyE,
+    other_any     = other_anyE,
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5)
+  )
+
+# County-level weights based on “any combination” totals
+county_race_weights_any <- hi_any %>%
+  group_by(county) %>%
+  summarise(
+    white_any     = sum(white_any, na.rm = TRUE),
+    black_any     = sum(black_any, na.rm = TRUE),
+    native_am_any = sum(native_am_any, na.rm = TRUE),
+    asian_any     = sum(asian_any, na.rm = TRUE),
+    pacific_any   = sum(pacific_any, na.rm = TRUE),
+    other_any     = sum(other_any, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    denom_any = sum(c_across(white_any:other_any)),
+    across(
+      white_any:other_any,
+      ~ ifelse(denom_any > 0, .x / denom_any, NA_real_),
+      .names = "w_{.col}"
+    )
+  ) %>%
+  ungroup() %>%
+  select(county, starts_with("w_"))
+
+# Fractionally allocate multiracial bucket into “any combination” races
+hi_tract_race_frac_any <- hi_base %>%
+  left_join(hi_any %>% select(tract, GEOID, county,
+                              white_any, black_any, native_am_any, asian_any, pacific_any, other_any),
+            by = c("tract", "GEOID", "county")) %>%
+  left_join(county_race_weights_any, by = "county") %>%
+  mutate(
+    white_f     = white_any     + multiracial * w_white_any,
+    black_f     = black_any     + multiracial * w_black_any,
+    native_am_f = native_am_any + multiracial * w_native_am_any,
+    asian_f     = asian_any     + multiracial * w_asian_any,
+    pacific_f   = pacific_any   + multiracial * w_pacific_any,
+    other_f     = other_any     + multiracial * w_other_any
+  ) %>%
+  select(
+    tract,
+    county,
+    white_f, black_f, native_am_f, asian_f, pacific_f, other_f
+  )
+
+# Long format for segregation indices
+hi_tract_race_frac_any_long <- hi_tract_race_frac_any %>%
+  pivot_longer(
+    cols = ends_with("_f"),
+    names_to = "race",
+    values_to = "n"
+  ) %>%
+  mutate(race = sub("_f$", "", race)) %>%
+  filter(!is.na(n), n > 0)
+
+# MH by county
+mh_frac_any_by_county <- mutual_within(
+  hi_tract_race_frac_any_long,
+  group  = "race",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble() %>%
+  rename(
+    M_fractional_any = M,
+    H_fractional_any = H
+  )
+
+mh_frac_any_by_county
+
+####stigma priority forced reassignment####
+library(tidycensus)
+library(dplyr)
+library(tidyr)
+library(segregation)
+library(stringr)
+
+race_raw <- get_decennial(
+  geography = "tract",
+  state = "HI",
+  year = 2020,
+  sumfile = "dhc",
+  table = "P8",          # detailed race table!!
+  geometry = FALSE,
+  output = "wide"
+)
+
+#priority vector
+priority <- c(
+  "Black or African American",
+  "Native Hawaiian and Other Pacific Islander",
+  "American Indian and Alaska Native",
+  "Asian",
+  "Some Other Race",
+  "White"
+)
+
+vars <- load_variables(year = 2020, dataset = "dhc", cache = TRUE)
+
+#Keep only the P8 variables
+p8_vars <- vars %>%
+  filter(str_detect(name, "^P8_")) %>%
+  select(name, label)
+
+#detect which priority races appear in a label
+detect_races <- function(lbl, races) {
+  present <- races[str_detect(lbl, fixed(races, ignore_case = TRUE))]
+  present
+}
+
+assign_group <- function(lbl, priority) {
+  present <- detect_races(lbl, priority)
+  if (length(present) == 0) return(NA_character_)
+  present[1]  #first match = highest priority
+}
+
+p8_map <- p8_vars %>%
+  mutate(
+    assigned_group = vapply(label, assign_group, character(1), priority = priority)
+  ) %>%
+  filter(!is.na(assigned_group))
+
+race_long <- race_raw %>%
+  pivot_longer(
+    cols = starts_with("P8_"),
+    names_to = "variable",
+    values_to = "n"
+  ) %>%
+  left_join(p8_map, by = c("variable" = "name")) %>%
+  filter(!is.na(assigned_group)) %>%
+  group_by(GEOID, assigned_group) %>%
+  summarise(n = sum(n, na.rm = TRUE), .groups = "drop")
+
+###state###
+forced_reassign_mh <- mutual_total(
+  data = race_long,
+  group = "assigned_group",
+  unit = "GEOID",
+  weight = "n"
+)
+
+###county###
+forced_reassign_mh_by_county <- mutual_within(
+  race_long %>%
+    mutate(county = substr(GEOID, 1, 5)),
+  group  = "assigned_group",
+  unit   = "GEOID",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble()
+
+####accounting for Hispanic####
+
+#Census data disaggregated table (p8) has no Hispanic cat. Have to use p9, which
+#removed detailed race table. Attempted a workaround, probably skewed data.
+
+#fractional: is there a way to assign Hispanic non/hisp to each category? BIG assumptions
+#nationality?
+#check out other papers
+
+
+# Pull P9 (Hispanic origin by race) from DHC
+p9_raw <- get_decennial(
+  geography = "tract",
+  state = "HI",
+  year = 2020,
+  sumfile = "dhc",
+  table = "P9",
+  geometry = FALSE,
+  output = "wide"
+)
+
+vars <- load_variables(year = 2020, dataset = "dhc", cache = TRUE)
+
+p9_vars <- vars %>%
+  filter(str_detect(name, "^P9_")) %>%
+  select(name, label)
+
+priority <- c(
+  "Black or African American",
+  "Native Hawaiian and Other Pacific Islander",
+  "American Indian and Alaska Native",
+  "Asian",
+  "Some Other Race",
+  "White"
+)
+
+detect_races <- function(lbl, races) {
+  races[str_detect(lbl, fixed(races, ignore_case = TRUE))]
+}
+
+assign_group_p9 <- function(lbl, priority) {
+  is_hisp <- str_detect(lbl, regex("Hispanic or Latino", ignore_case = TRUE))
+  is_nonh <- str_detect(lbl, regex("Not Hispanic or Latino", ignore_case = TRUE))
+  
+  # Skip totals / headers that don't describe a race row
+  if (!is_hisp && !is_nonh) return(NA_character_)
+  
+  # Hispanic handling
+  if (is_hisp) {
+    has_black <- str_detect(lbl, fixed("Black or African American", ignore_case = TRUE))
+    if (has_black) return("Black or African American")
+    return("Hispanic")
+  }
+  
+  # Not Hispanic: assign by stigma-priority race
+  present <- detect_races(lbl, priority)
+  if (length(present) == 0) return(NA_character_)
+  present[1]
+}
+
+p9_map <- p9_vars %>%
+  mutate(assigned_group = vapply(label, assign_group_p9, character(1), priority = priority)) %>%
+  filter(!is.na(assigned_group))
+
+p9_long <- p9_raw %>%
+  pivot_longer(
+    cols = starts_with("P9_"),
+    names_to = "variable",
+    values_to = "n"
+  ) %>%
+  left_join(p9_map, by = c("variable" = "name")) %>%
+  filter(!is.na(assigned_group)) %>%
+  group_by(GEOID, assigned_group) %>%
+  summarise(n = sum(n, na.rm = TRUE), .groups = "drop")
+
+# Statewide MH
+forced_hisp_mh_state <- mutual_total(
+  data = p9_long,
+  group = "assigned_group",
+  unit  = "GEOID",
+  weight = "n"
+)
+
+# County MH
+forced_hisp_mh_by_county <- mutual_within(
+  p9_long %>% mutate(county = substr(GEOID, 1, 5)),
+  group  = "assigned_group",
+  unit   = "GEOID",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble()
+
+forced_hisp_mh_state
+forced_hisp_mh_by_county
+
+####comparison table####
+
+mh_excluded_tbl <- mh_by_county %>%
+  transmute(
+    county,
+    method = "Single-race only (multiracial excluded)",
+    M = M,
+    H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_binary_tbl <- mh_multi_by_county %>%
+  transmute(
+    county,
+    method = "Multiracial vs non-multiracial (binary)",
+    M = M,
+    H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_multigroup_tbl <- mh_by_county_multigroup %>%
+  transmute(
+    county,
+    method = "Multiracial as own race (7-group)",
+    M = M,
+    H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+# UPDATED: fractional uses “alone or in any combination” weights
+mh_fractional_tbl <- mh_frac_any_by_county %>%
+  transmute(
+    county,
+    method = "Fractional multiracial allocation (any-combo weights)",
+    M = M_fractional_any,
+    H = H_fractional_any,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_forced_tbl <- forced_reassign_mh_by_county %>%
+  transmute(
+    county,
+    method = "Stigma-priority forced reassignment",
+    M = M,
+    H = H,
+    year = 2020,
+    dataset = "Decennial DHC"
+  )
+
+# include P8 disaggregated combo-as-group method
+mh_combo_tbl <- mh_combo_by_county %>%
+   transmute(
+     county,
+     method = "Disaggregated race combinations (P8; combo-as-group)",
+     M = M,
+     H = H,
+     year = 2020,
+     dataset = "Decennial DHC"
+   )
+
+mh_comparison_table <- bind_rows(
+  mh_excluded_tbl,
+  mh_binary_tbl,
+  mh_multigroup_tbl,
+  mh_fractional_tbl,
+  mh_forced_tbl
+  # , mh_combo_tbl
+) %>%
+  arrange(county, method)
+
+mh_comparison_table
+
+# wide M index table
+mh_comparison_wide <- mh_comparison_table %>%
+  select(county, method, M) %>%
+  pivot_wider(
+    names_from = method,
+    values_from = M
+  )
+
+mh_comparison_wide
+
+# Rebuild mh_plot_long from the new mh_comparison_table 
+mh_plot_long <- mh_comparison_table %>%
+  pivot_longer(
+    cols = c(M, H),
+    names_to = "index",
+    values_to = "value"
+  ) %>%
+  mutate(
+    method = factor(
+      method,
+      levels = c(
+        "Single-race only (multiracial excluded)",
+        "Multiracial as own race (7-group)",
+        "Fractional multiracial allocation (any-combo weights)",
+        "Stigma-priority forced reassignment",
+        "Multiracial vs non-multiracial (binary)",
+        "Disaggregated race combinations (P8; combo-as-group)"
+      )
+    )
+  )
+
+# County labels
+county_lut <- tibble(
+  county = c("15001", "15003", "15007", "15009"),
+  county_name = c("Hawaiʻi", "Honolulu", "Kauaʻi", "Maui")
+)
+
+mh_plot_long <- mh_plot_long %>%
+  left_join(county_lut, by = "county") %>%
+  mutate(
+    county_name = factor(county_name, levels = c("Hawaiʻi", "Honolulu", "Kauaʻi", "Maui"))
+  )
+
+
+####plotting####
+
+#  Build/refresh comparison table with  P8 combo-as-group method 
+mh_excluded_tbl <- mh_by_county %>%
+  transmute(
+    county,
+    method = "Single-race only (multiracial excluded)",
+    M = M, H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_multigroup_tbl <- mh_by_county_multigroup %>%
+  transmute(
+    county,
+    method = "Multiracial as own race (7-group)",
+    M = M, H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_fractional_tbl <- mh_frac_any_by_county %>%
+  transmute(
+    county,
+    method = "Fractional multiracial allocation (any-combo weights)",
+    M = M_fractional_any, H = H_fractional_any,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_forced_tbl <- forced_reassign_mh_by_county %>%
+  transmute(
+    county,
+    method = "Stigma-priority forced reassignment",
+    M = M, H = H,
+    year = 2020,
+    dataset = "Decennial DHC"
+  )
+
+mh_binary_tbl <- mh_multi_by_county %>%
+  transmute(
+    county,
+    method = "Multiracial vs non-multiracial (binary)",
+    M = M, H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+# P8 combo-as-group method (Decennial 2020 DHC)
+mh_combo_tbl <- mh_combo_by_county %>%
+  transmute(
+    county,
+    method = "Disaggregated race combinations (P8; combo-as-group)",
+    M = M, H = H,
+    year = 2020,
+    dataset = "Decennial DHC"
+  )
+
+mh_comparison_table <- bind_rows(
+  mh_excluded_tbl,
+  mh_multigroup_tbl,
+  mh_fractional_tbl,
+  mh_forced_tbl,
+  mh_binary_tbl,
+  mh_combo_tbl
+) %>%
+  arrange(county, method)
+
+# Rebuild plotting long table from fresh comparison table
+method_levels <- c(
+  "Single-race only (multiracial excluded)",
+  "Disaggregated race combinations (P8; combo-as-group)",
+  "Multiracial as own race (7-group)",
+  "Stigma-priority forced reassignment",
+  "Fractional multiracial allocation (any-combo weights)",
+  "Multiracial vs non-multiracial (binary)"
+)
+
+county_lut <- tibble(
+  county = c("15001", "15003", "15007", "15009"),
+  county_name = c("Hawaiʻi", "Honolulu", "Kauaʻi", "Maui")
+)
+
+mh_plot_long <- mh_comparison_table %>%
+  # keep only the methods we want, even if something extra is present
+  filter(method %in% method_levels) %>%
+  pivot_longer(
+    cols = c(M, H),
+    names_to = "index",
+    values_to = "value"
+  ) %>%
+  mutate(
+    method = factor(method, levels = method_levels),
+    index  = factor(index, levels = c("M", "H"))
+  ) %>%
+  left_join(county_lut, by = "county") %>%
+  mutate(
+    county_name = factor(county_name, levels = c("Hawaiʻi", "Honolulu", "Kauaʻi", "Maui"))
+  )
+
+# Quick check: confirm all 6 methods are present
+mh_plot_long %>%
+  distinct(method) %>%
+  arrange(method)
+
+# diagnostic by county/index:
+mh_plot_long %>%
+  count(county_name, index, method) %>%
+  tidyr::pivot_wider(names_from = method, values_from = n, values_fill = 0)
+
+# Plot
+ggplot(
+  mh_plot_long,
+  aes(x = method, y = value, color = county_name, group = county_name)
+) +
+  geom_point(size = 3) +
+  geom_line(alpha = 0.5) +
+  facet_wrap(~ index, scales = "free_y") +
+  labs(
+    x = "Multiracial assignment method",
+    y = "Segregation index value",
+    color = "County"
+  ) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 30), drop = FALSE) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
