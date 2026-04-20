@@ -1,0 +1,680 @@
+library(tidycensus)
+library(dplyr)
+library(tidyr)
+library(segregation)
+library(stringr)
+library(ggplot2)
+library(tibble)
+
+race_vars <- c(
+  white = "B02001_002",
+  black = "B02001_003",
+  native_am = "B02001_004",
+  asian = "B02001_005",
+  pacific = "B02001_006",
+  other = "B02001_007"
+)
+
+# Seattle metro counties
+seattle_counties <- tibble(
+  county_name = c("King", "Pierce", "Snohomish"),
+  GEOID = c("53033", "53053", "53061")
+)
+
+seattle_county_fips <- seattle_counties$GEOID
+
+#### multirace excluded ####
+
+sea_tract_race_long <- get_acs(
+  geography = "tract",
+  state = "WA",
+  variables = race_vars,
+  year = 2019,
+  survey = "acs5"
+) %>%
+  mutate(
+    race = if_else(
+      variable %in% names(race_vars),
+      variable,
+      names(race_vars)[match(variable, race_vars)]
+    )
+  ) %>%
+  transmute(
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5),
+    race,
+    n = estimate
+  ) %>%
+  filter(
+    county %in% seattle_county_fips,
+    !is.na(race),
+    !is.na(n),
+    n > 0
+  )
+
+mh_by_county_sea <- mutual_within(
+  sea_tract_race_long,
+  group  = "race",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble()
+
+mh_metro_sea <- mutual_total(
+  sea_tract_race_long,
+  group  = "race",
+  unit   = "tract",
+  weight = "n"
+)
+
+mh_by_county_boot_sea <- mutual_within(
+  sea_tract_race_long,
+  group  = "race",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE,
+  se     = TRUE,
+  CI     = 0.95,
+  n_bootstrap = 500
+)
+
+dissimilarity_by_county <- function(data_long, group_a, group_b, county_col = "county",
+                                    unit_col = "tract", group_col = "race", n_col = "n") {
+  wide <- data_long %>%
+    filter(.data[[group_col]] %in% c(group_a, group_b)) %>%
+    select(all_of(c(county_col, unit_col, group_col, n_col))) %>%
+    pivot_wider(names_from = all_of(group_col), values_from = all_of(n_col), values_fill = 0)
+  
+  if (!group_a %in% names(wide)) wide[[group_a]] <- 0
+  if (!group_b %in% names(wide)) wide[[group_b]] <- 0
+  
+  wide %>%
+    group_by(.data[[county_col]]) %>%
+    summarise(
+      D = {
+        Xa <- sum(.data[[group_a]], na.rm = TRUE)
+        Xb <- sum(.data[[group_b]], na.rm = TRUE)
+        if (Xa == 0 || Xb == 0) NA_real_ else {
+          0.5 * sum(abs((.data[[group_a]] / Xa) - (.data[[group_b]] / Xb)), na.rm = TRUE)
+        }
+      },
+      .groups = "drop"
+    ) %>%
+    rename(county = all_of(county_col))
+}
+
+sea_long_nhpi <- sea_tract_race_long %>%
+  mutate(
+    race2 = case_when(
+      race == "white" ~ "white",
+      race %in% c("native_am", "pacific") ~ "nhpi",
+      TRUE ~ "other"
+    )
+  ) %>%
+  group_by(tract, county, race2) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  rename(race = race2)
+
+D_white_nhpi_sea <- dissimilarity_by_county(sea_long_nhpi, "white", "nhpi")
+
+#### multirace vs allelse ####
+
+vars_multi <- c(
+  total = "B02001_001",
+  multiracial = "B02001_008"
+)
+
+sea_tract_multi <- get_acs(
+  geography = "tract",
+  state = "WA",
+  variables = vars_multi,
+  year = 2019,
+  survey = "acs5"
+) %>%
+  mutate(
+    varname = if_else(
+      variable %in% names(vars_multi),
+      variable,
+      names(vars_multi)[match(variable, vars_multi)]
+    )
+  ) %>%
+  select(GEOID, varname, estimate) %>%
+  pivot_wider(names_from = varname, values_from = estimate) %>%
+  transmute(
+    tract = GEOID,
+    county = substr(GEOID, 1, 5),
+    multiracial = multiracial,
+    non_multiracial = pmax(total - multiracial, 0)
+  ) %>%
+  filter(county %in% seattle_county_fips)
+
+sea_tract_multi_long <- sea_tract_multi %>%
+  pivot_longer(
+    cols = c(multiracial, non_multiracial),
+    names_to = "group",
+    values_to = "n"
+  ) %>%
+  filter(!is.na(n), n > 0)
+
+mh_multi_by_county_sea <- mutual_within(
+  sea_tract_multi_long,
+  group  = "group",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble()
+
+mh_multi_metro_sea <- mutual_total(
+  sea_tract_multi_long,
+  group  = "group",
+  unit   = "tract",
+  weight = "n"
+)
+
+D_multi_by_county_sea <- sea_tract_multi %>%
+  group_by(county) %>%
+  summarise(
+    D = {
+      Xa <- sum(multiracial, na.rm = TRUE)
+      Xb <- sum(non_multiracial, na.rm = TRUE)
+      if (Xa == 0 || Xb == 0) NA_real_ else {
+        0.5 * sum(abs((multiracial / Xa) - (non_multiracial / Xb)), na.rm = TRUE)
+      }
+    },
+    .groups = "drop"
+  )
+
+multi_segregation_by_county_sea <- mh_multi_by_county_sea %>%
+  left_join(D_multi_by_county_sea, by = "county")
+
+#### multirace as own "race" ####
+
+vacs <- load_variables(2022, "acs5", cache = TRUE)
+
+race_vars_full <- c(
+  white = "B02001_002",
+  black = "B02001_003",
+  native_am = "B02001_004",
+  asian = "B02001_005",
+  pacific = "B02001_006",
+  other = "B02001_007",
+  multiracial = "B02001_008"
+)
+
+sea_tract_race_long_full <- get_acs(
+  geography = "tract",
+  state = "WA",
+  variables = race_vars_full,
+  year = 2019,
+  survey = "acs5"
+) %>%
+  mutate(
+    race = if_else(
+      variable %in% names(race_vars_full),
+      variable,
+      names(race_vars_full)[match(variable, race_vars_full)]
+    )
+  ) %>%
+  transmute(
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5),
+    race,
+    n = estimate
+  ) %>%
+  filter(
+    county %in% seattle_county_fips,
+    !is.na(race),
+    !is.na(n),
+    n > 0
+  )
+
+mh_by_county_multigroup_sea <- mutual_within(
+  sea_tract_race_long_full,
+  group  = "race",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble()
+
+mh_multigroup_metro_sea <- mutual_total(
+  sea_tract_race_long_full,
+  group  = "race",
+  unit   = "tract",
+  weight = "n"
+)
+
+#### multirace as own "race", with disaggregated racial combinations ####
+
+race_raw <- get_decennial(
+  geography = "tract",
+  state = "WA",
+  year = 2020,
+  sumfile = "dhc",
+  table = "P8",
+  geometry = FALSE,
+  output = "wide"
+)
+
+vars <- load_variables(year = 2020, dataset = "dhc", cache = TRUE)
+
+p8_vars <- vars %>%
+  filter(str_detect(name, "^P8_")) %>%
+  select(variable = name, label)
+
+clean_p8_label <- function(x) {
+  x %>%
+    str_replace_all("^.*?!!", "") %>%
+    str_replace_all("!!", " / ") %>%
+    str_squish()
+}
+
+p8_map <- p8_vars %>%
+  mutate(combo = clean_p8_label(label))
+
+sea_tract_combo_long <- race_raw %>%
+  pivot_longer(
+    cols = starts_with("P8_"),
+    names_to = "variable",
+    values_to = "n"
+  ) %>%
+  left_join(p8_map, by = "variable") %>%
+  transmute(
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5),
+    combo,
+    n
+  ) %>%
+  filter(
+    county %in% seattle_county_fips,
+    !is.na(combo),
+    !is.na(n),
+    n > 0
+  )
+
+sea_tract_combo_long <- sea_tract_combo_long %>%
+  filter(!combo %in% c("Total:", "Total"))
+
+sea_tract_combo_long <- sea_tract_combo_long %>%
+  filter(str_count(combo, "/") > 0) %>%
+  filter(!str_detect(combo, regex(":\\s*$", ignore_case = TRUE)))
+
+mh_combo_by_county_sea <- mutual_within(
+  sea_tract_combo_long,
+  group  = "combo",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble()
+
+mh_combo_metro_sea <- mutual_total(
+  sea_tract_combo_long,
+  group  = "combo",
+  unit   = "tract",
+  weight = "n"
+)
+
+#### fractional multirace - rep prop of counties ####
+
+vars_base <- c(
+  total       = "B02001_001",
+  multiracial = "B02001_008"
+)
+
+sea_base <- get_acs(
+  geography = "tract",
+  state = "WA",
+  variables = vars_base,
+  year = 2019,
+  survey = "acs5",
+  output = "wide"
+) %>%
+  transmute(
+    GEOID,
+    total       = totalE,
+    multiracial = multiracialE,
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5)
+  ) %>%
+  filter(county %in% seattle_county_fips)
+
+vars_combo <- c(
+  white_any     = "B02008_001",
+  black_any     = "B02009_001",
+  native_am_any = "B02010_001",
+  asian_any     = "B02011_001",
+  pacific_any   = "B02012_001",
+  other_any     = "B02013_001"
+)
+
+sea_any <- get_acs(
+  geography = "tract",
+  state = "WA",
+  variables = vars_combo,
+  year = 2019,
+  survey = "acs5",
+  output = "wide"
+) %>%
+  transmute(
+    GEOID,
+    white_any     = white_anyE,
+    black_any     = black_anyE,
+    native_am_any = native_am_anyE,
+    asian_any     = asian_anyE,
+    pacific_any   = pacific_anyE,
+    other_any     = other_anyE,
+    tract  = GEOID,
+    county = substr(GEOID, 1, 5)
+  ) %>%
+  filter(county %in% seattle_county_fips)
+
+county_race_weights_any_sea <- sea_any %>%
+  group_by(county) %>%
+  summarise(
+    white_any     = sum(white_any, na.rm = TRUE),
+    black_any     = sum(black_any, na.rm = TRUE),
+    native_am_any = sum(native_am_any, na.rm = TRUE),
+    asian_any     = sum(asian_any, na.rm = TRUE),
+    pacific_any   = sum(pacific_any, na.rm = TRUE),
+    other_any     = sum(other_any, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    denom_any = sum(c_across(white_any:other_any)),
+    across(
+      white_any:other_any,
+      ~ ifelse(denom_any > 0, .x / denom_any, NA_real_),
+      .names = "w_{.col}"
+    )
+  ) %>%
+  ungroup() %>%
+  select(county, starts_with("w_"))
+
+sea_tract_race_frac_any <- sea_base %>%
+  left_join(
+    sea_any %>%
+      select(
+        tract, GEOID, county,
+        white_any, black_any, native_am_any, asian_any, pacific_any, other_any
+      ),
+    by = c("tract", "GEOID", "county")
+  ) %>%
+  left_join(county_race_weights_any_sea, by = "county") %>%
+  mutate(
+    white_f     = white_any     + multiracial * w_white_any,
+    black_f     = black_any     + multiracial * w_black_any,
+    native_am_f = native_am_any + multiracial * w_native_am_any,
+    asian_f     = asian_any     + multiracial * w_asian_any,
+    pacific_f   = pacific_any   + multiracial * w_pacific_any,
+    other_f     = other_any     + multiracial * w_other_any
+  ) %>%
+  select(
+    tract,
+    county,
+    white_f, black_f, native_am_f, asian_f, pacific_f, other_f
+  )
+
+sea_tract_race_frac_any_long <- sea_tract_race_frac_any %>%
+  pivot_longer(
+    cols = ends_with("_f"),
+    names_to = "race",
+    values_to = "n"
+  ) %>%
+  mutate(race = sub("_f$", "", race)) %>%
+  filter(!is.na(n), n > 0)
+
+mh_frac_any_by_county_sea <- mutual_within(
+  sea_tract_race_frac_any_long,
+  group  = "race",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble() %>%
+  rename(
+    M_fractional_any = M,
+    H_fractional_any = H
+  )
+
+mh_frac_any_metro_sea <- mutual_total(
+  sea_tract_race_frac_any_long,
+  group  = "race",
+  unit   = "tract",
+  weight = "n"
+)
+
+#### stigma priority forced reassignment ####
+
+priority <- c(
+  "Black or African American",
+  "Native Hawaiian and Other Pacific Islander",
+  "American Indian and Alaska Native",
+  "Asian",
+  "Some Other Race",
+  "White"
+)
+
+race_raw <- get_decennial(
+  geography = "tract",
+  state = "WA",
+  year = 2020,
+  sumfile = "dhc",
+  table = "P8",
+  geometry = FALSE,
+  output = "wide"
+)
+
+vars <- load_variables(year = 2020, dataset = "dhc", cache = TRUE)
+
+p8_vars <- vars %>%
+  filter(str_detect(name, "^P8_")) %>%
+  select(name, label)
+
+detect_races <- function(lbl, races) {
+  present <- races[str_detect(lbl, fixed(races, ignore_case = TRUE))]
+  present
+}
+
+assign_group <- function(lbl, priority) {
+  present <- detect_races(lbl, priority)
+  if (length(present) == 0) return(NA_character_)
+  present[1]
+}
+
+p8_map <- p8_vars %>%
+  mutate(
+    assigned_group = vapply(label, assign_group, character(1), priority = priority)
+  ) %>%
+  filter(!is.na(assigned_group))
+
+sea_race_long <- race_raw %>%
+  pivot_longer(
+    cols = starts_with("P8_"),
+    names_to = "variable",
+    values_to = "n"
+  ) %>%
+  left_join(p8_map, by = c("variable" = "name")) %>%
+  transmute(
+    tract = GEOID,
+    county = substr(GEOID, 1, 5),
+    assigned_group,
+    n
+  ) %>%
+  filter(
+    county %in% seattle_county_fips,
+    !is.na(assigned_group),
+    !is.na(n),
+    n > 0
+  ) %>%
+  group_by(tract, county, assigned_group) %>%
+  summarise(n = sum(n, na.rm = TRUE), .groups = "drop")
+
+forced_reassign_mh_sea <- mutual_total(
+  data = sea_race_long,
+  group = "assigned_group",
+  unit = "tract",
+  weight = "n"
+)
+
+forced_reassign_mh_by_county_sea <- mutual_within(
+  sea_race_long,
+  group  = "assigned_group",
+  unit   = "tract",
+  within = "county",
+  weight = "n",
+  wide   = TRUE
+) %>%
+  as_tibble()
+
+#### comparison table — Seattle metro ####
+
+mh_excluded_tbl_sea <- mh_by_county_sea %>%
+  transmute(
+    county,
+    method = "Single-race only (multiracial excluded)",
+    M = M,
+    H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_binary_tbl_sea <- mh_multi_by_county_sea %>%
+  transmute(
+    county,
+    method = "Multiracial vs non-multiracial (binary)",
+    M = M,
+    H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_multigroup_tbl_sea <- mh_by_county_multigroup_sea %>%
+  transmute(
+    county,
+    method = "Multiracial as own race (7-group)",
+    M = M,
+    H = H,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_fractional_tbl_sea <- mh_frac_any_by_county_sea %>%
+  transmute(
+    county,
+    method = "Fractional multiracial allocation (any-combo weights)",
+    M = M_fractional_any,
+    H = H_fractional_any,
+    year = 2019,
+    dataset = "ACS 5-year"
+  )
+
+mh_forced_tbl_sea <- forced_reassign_mh_by_county_sea %>%
+  transmute(
+    county,
+    method = "Stigma-priority forced reassignment",
+    M = M,
+    H = H,
+    year = 2020,
+    dataset = "Decennial DHC"
+  )
+
+mh_combo_tbl_sea <- mh_combo_by_county_sea %>%
+  transmute(
+    county,
+    method = "Disaggregated race combinations (P8; combo-as-group)",
+    M = M,
+    H = H,
+    year = 2020,
+    dataset = "Decennial DHC"
+  )
+
+mh_comparison_table_sea <- bind_rows(
+  mh_excluded_tbl_sea,
+  mh_binary_tbl_sea,
+  mh_multigroup_tbl_sea,
+  mh_fractional_tbl_sea,
+  mh_forced_tbl_sea,
+  mh_combo_tbl_sea
+) %>%
+  arrange(county, method)
+
+mh_comparison_table_sea
+
+mh_comparison_wide_sea <- mh_comparison_table_sea %>%
+  select(county, method, M) %>%
+  pivot_wider(
+    names_from = method,
+    values_from = M
+  )
+
+mh_comparison_wide_sea
+
+#### plotting — Seattle metro ####
+
+method_levels <- c(
+  "Single-race only (multiracial excluded)",
+  "Disaggregated race combinations (P8; combo-as-group)",
+  "Multiracial as own race (7-group)",
+  "Stigma-priority forced reassignment",
+  "Fractional multiracial allocation (any-combo weights)",
+  "Multiracial vs non-multiracial (binary)"
+)
+
+county_lut_sea <- seattle_counties %>%
+  transmute(
+    county = GEOID,
+    county_name = county_name
+  )
+
+mh_plot_long_sea <- mh_comparison_table_sea %>%
+  filter(method %in% method_levels) %>%
+  pivot_longer(
+    cols = c(M, H),
+    names_to = "index",
+    values_to = "value"
+  ) %>%
+  mutate(
+    method = factor(method, levels = method_levels),
+    index = factor(index, levels = c("M", "H"))
+  ) %>%
+  left_join(county_lut_sea, by = "county") %>%
+  mutate(
+    county_name = factor(county_name, levels = c("King", "Pierce", "Snohomish"))
+  )
+
+mh_plot_long_sea %>%
+  distinct(method) %>%
+  arrange(method)
+
+mh_plot_long_sea %>%
+  count(county_name, index, method) %>%
+  pivot_wider(names_from = method, values_from = n, values_fill = 0)
+
+ggplot(
+  mh_plot_long_sea,
+  aes(x = method, y = value, color = county_name, group = county_name)
+) +
+  geom_point(size = 2.5) +
+  geom_line(alpha = 0.5) +
+  facet_wrap(~ index, scales = "free_y") +
+  labs(
+    x = "Multiracial assignment method",
+    y = "Segregation index value",
+    color = "County"
+  ) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 30), drop = FALSE) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
